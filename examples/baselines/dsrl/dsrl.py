@@ -169,6 +169,8 @@ class Args:
     """target network update rate"""
     bootstrap_at_done: str = "always"
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
+    noise_critic_target: str = "critic"
+    """the target network to use for noise critic"""
     
     # Training specific arguments
     learning_starts: int = 4_000
@@ -970,8 +972,14 @@ if __name__ == "__main__":
                     diffusion_actions_unflat = agent.diffusion_policy.get_action(data.obs, initial_noise=gaussian_noise)  # (B, act_horizon, act_dim)
                     diffusion_actions = diffusion_actions_unflat.flatten(start_dim=1)  # Flatten for critic
                     # Get critic values for these actions
-                    target_critic1_value = agent.critic1(data.obs, diffusion_actions)
-                    target_critic2_value = agent.critic2(data.obs, diffusion_actions)
+                    if args.noise_critic_target == "critic":
+                        target_critic1_value = agent.critic1(data.obs, diffusion_actions)
+                        target_critic2_value = agent.critic2(data.obs, diffusion_actions)
+                    elif args.noise_critic_target == "critic_target":
+                        target_critic1_value = agent.critic1_target(data.obs, diffusion_actions)
+                        target_critic2_value = agent.critic2_target(data.obs, diffusion_actions)
+                    else:
+                        raise ValueError(f"Invalid noise critic target: {args.noise_critic_target}")
 
                 # Predict noise critic values
                 noise_critic1_pred = agent.noise_critic1(data.obs, gaussian_noise)
