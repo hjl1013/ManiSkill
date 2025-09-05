@@ -125,15 +125,15 @@ class Args:
     """the id of the environment"""
     
     # Algorithm specific arguments
-    total_timesteps: int = 1_000_000
+    total_timesteps: int = 2_000_000
     """total timesteps of the experiments"""
-    buffer_size: int = 1_000_000
+    buffer_size: int = 500_000
     """the replay memory buffer size"""
     buffer_device: str = "cuda"
     """where the replay buffer is stored. Can be 'cpu' or 'cuda' for GPU"""
     batch_size: int = 256
     """the batch size of sample from the replay memory"""
-    num_envs: int = 16
+    num_envs: int = 32
     """the number of parallel environments"""
     num_eval_envs: int = 16
     """the number of parallel evaluation environments"""
@@ -153,9 +153,9 @@ class Args:
     """number of groups for group normalization"""
     
     # DSRL specific arguments
-    pretrained_diffusion_path: Optional[str] = "/home/hyunjun/projects/p-self-improvement/ManiSkill/examples/baselines/dsrl/diffusion_policy/diffusion_policy.pt"
+    pretrained_diffusion_path: Optional[str] = None
     """path to pretrained diffusion policy model"""
-    noise_action_scale: float = 1
+    noise_action_scale: float = 1.5
     """scale for noise action"""
     noise_actor_lr: float = 3e-4
     """learning rate for noise actor"""
@@ -167,7 +167,7 @@ class Args:
     """discount factor"""
     tau: float = 0.005
     """target network update rate"""
-    bootstrap_at_done: str = "always"
+    bootstrap_at_done: str = "never"
     """the bootstrap method to use when a done signal is received. Can be 'always' or 'never'"""
     noise_critic_target: str = "critic"
     """the target network to use for noise critic"""
@@ -177,7 +177,7 @@ class Args:
     """timestep to start learning"""
     training_freq: int = 512
     """training frequency (in steps)"""
-    utd: float = 0.05
+    utd: float = 0.5
     """update to data ratio"""
     policy_frequency: int = 4
     """the frequency of training policy (delayed)"""
@@ -185,15 +185,21 @@ class Args:
     """the frequency of training noise critic"""
     target_network_frequency: int = 1
     """the frequency of updates for the target networks"""
-    alpha: float = 0.2
+    target_entropy: float = None
+    """target entropy for noise actor"""
+    alpha: float = 0.0
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
-    
+    clip_grad: bool = True
+    """if toggled, clip gradients"""
+    max_grad_norm: float = 1.0
+    """the maximum gradient norm"""
+
     # Environment specific arguments
     max_episode_steps: int = 100
     """the number of steps to run in each evaluation environment during evaluation"""
-    eval_freq: int = 25
+    eval_freq: int = 50_000
     """evaluation frequency in terms of iterations"""
     log_freq: int = 1_000
     """logging frequency in terms of environment steps"""
@@ -213,11 +219,15 @@ class Args:
     """the reward mode to use for the environment"""
     reward_scale: float = 1.0
     """the scale of the reward"""
-    reward_bias: float = 0.0
+    reward_bias: float = -1.0
     """the bias of the reward"""
     no_entropy: bool = False
     """if toggled, do not use entropy regularization"""
-
+    clip_entropy: bool = True
+    """if toggled, clip entropy"""
+    clip_entropy_value: float = 0.0
+    """the value to clip entropy"""
+    
     # to be filled in runtime
     grad_steps_per_iteration: int = 0
     """the number of gradient updates per iteration"""
@@ -623,6 +633,9 @@ if __name__ == "__main__":
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
+
+    if args.pretrained_diffusion_path is None:
+        args.pretrained_diffusion_path = f"diffusion_policy/{args.env_id}.pt"
         
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -735,7 +748,10 @@ if __name__ == "__main__":
     # Automatic entropy tuning
     if args.autotune:
         # Target entropy for noise space (pred_horizon * act_dim)
-        target_entropy = -torch.prod(torch.Tensor([args.pred_horizon * envs.single_action_space.shape[0]]).to(device)).item()
+        if args.target_entropy is None:
+            target_entropy = -torch.prod(torch.Tensor([args.pred_horizon * envs.single_action_space.shape[0]]).to(device)).item()
+        else:
+            target_entropy = args.target_entropy
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         # Load log_alpha from checkpoint if available
         if args.checkpoint is not None and ckpt is not None and 'log_alpha' in ckpt and ckpt['log_alpha'] is not None:
@@ -947,6 +963,8 @@ if __name__ == "__main__":
                 target_q2 = agent.critic2_target(data.next_obs, next_action_chunks)
                 if args.no_entropy:
                     min_target_q = torch.min(target_q1, target_q2)
+                elif args.clip_entropy:
+                    min_target_q = torch.min(target_q1, target_q2) - alpha * next_log_probs.clamp(min=-args.clip_entropy_value, max=args.clip_entropy_value)
                 else:
                     min_target_q = torch.min(target_q1, target_q2) - alpha * next_log_probs
                 target_q_value = data.rewards.unsqueeze(-1) + (1 - data.dones.unsqueeze(-1)) * args.gamma * min_target_q
@@ -959,6 +977,9 @@ if __name__ == "__main__":
             critic_loss = critic1_loss + critic2_loss
 
             critic_optimizer.zero_grad()
+            if args.clip_grad:
+                torch.nn.utils.clip_grad_norm_(agent.critic1.parameters(), args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(agent.critic2.parameters(), args.max_grad_norm)
             critic_loss.backward()
             critic_optimizer.step()
 
@@ -992,6 +1013,9 @@ if __name__ == "__main__":
 
                 noise_critic_optimizer.zero_grad()
                 noise_critic_loss.backward()
+                if args.clip_grad:
+                    torch.nn.utils.clip_grad_norm_(agent.noise_critic1.parameters(), args.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(agent.noise_critic2.parameters(), args.max_grad_norm)
                 noise_critic_optimizer.step()
 
             # Train Noise Actor (SAC-style using Noise Critics)
@@ -1012,6 +1036,8 @@ if __name__ == "__main__":
 
                 noise_actor_optimizer.zero_grad()
                 noise_actor_loss.backward()
+                if args.clip_grad:
+                    torch.nn.utils.clip_grad_norm_(agent.noise_actor.parameters(), args.max_grad_norm)
                 noise_actor_optimizer.step()
 
                 # Update entropy coefficient
@@ -1022,6 +1048,8 @@ if __name__ == "__main__":
 
                     alpha_optimizer.zero_grad()
                     alpha_loss.backward()
+                    if args.clip_grad:
+                        torch.nn.utils.clip_grad_norm_([log_alpha], args.max_grad_norm)
                     alpha_optimizer.step()
                     alpha = log_alpha.exp().item()
                     mean_log_probs = log_probs_detached.mean().item()
